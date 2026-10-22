@@ -1,0 +1,19 @@
+# настоящие настройки сюда не кладём: внутри ключи и адреса
+config.toml
+*.key
+*.keys
+*.uuid
+*.sid
+# выдача для клиентов — персональные ссылки
+share/
+invites/
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.DS_Store

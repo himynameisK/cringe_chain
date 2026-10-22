@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cringe-chain"
+version = "0.1.0"
+description = "Селективный прокси через цепочку своих серверов на macOS"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+qr = ["segno>=1.6"]
+
+[project.scripts]
+cringe = "cringe_chain.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cringe_chain"]
