@@ -13,7 +13,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from cringe_chain import cli, config as cfgmod, safety
+from cringe_chain import cli, config as cfgmod, launcher, safety
 
 
 def make_cfg(root: pathlib.Path, entry=43210, socks=43211) -> cfgmod.Config:
@@ -30,7 +30,7 @@ def make_cfg(root: pathlib.Path, entry=43210, socks=43211) -> cfgmod.Config:
         "routing": {"tunnel_domains": ["example.com"], "no_proxy": [".internal.example.org"]},
         "servers": [{"name": "uz", "host": "198.51.100.10", "port": 443,
                      "protocol": "shadowsocks", "method": "2022-blake3-aes-128-gcm",
-                     "password": "cGFzc3dvcmQtZm9yLXRlc3Rz"}],
+                     "password": "AAAAAAAAAAAAAAAAAAAAAA=="}],
     })
 
 
@@ -164,9 +164,12 @@ class ApplyRollbackTest(unittest.TestCase):
         return mock.Mock(config=None, dry_run=False, force=False, json=False)
 
     def test_failed_start_restores_previous_config(self):
+        # Репетиция прошла, а служба всё равно не встала — редкий случай,
+        # ради которого откат и остаётся второй линией обороны.
         with mock.patch.object(cli, "_load", return_value=self.cfg), \
              mock.patch.object(safety, "preflight", return_value=[]), \
-             mock.patch.object(safety, "config_is_valid", return_value=(True, "")), \
+             mock.patch.object(cli.launcher, "boot_test",
+                               return_value=launcher.BootResult(True, "поднялся")), \
              mock.patch.object(safety, "wait_for_port", return_value=False), \
              mock.patch.object(cli.system, "brew_service",
                                side_effect=lambda a, *rest, **kw: self.restarts.append(a) or []):
@@ -181,7 +184,8 @@ class ApplyRollbackTest(unittest.TestCase):
     def test_successful_apply_keeps_new_config(self):
         with mock.patch.object(cli, "_load", return_value=self.cfg), \
              mock.patch.object(safety, "preflight", return_value=[]), \
-             mock.patch.object(safety, "config_is_valid", return_value=(True, "")), \
+             mock.patch.object(cli.launcher, "boot_test",
+                               return_value=launcher.BootResult(True, "поднялся")), \
              mock.patch.object(safety, "wait_for_port", return_value=True), \
              mock.patch.object(cli.system, "brew_service", return_value=[]):
             rc = cli.cmd_apply(self._args())
@@ -189,16 +193,19 @@ class ApplyRollbackTest(unittest.TestCase):
         written = json.loads(self.cfg.local.singbox_config.read_text())
         self.assertEqual("direct", written["route"]["final"])
 
-    def test_bad_config_never_touches_the_service(self):
+    def test_config_that_does_not_boot_never_touches_anything(self):
+        # Репетиция не прошла — значит ни файла, ни службы касаться нельзя.
         with mock.patch.object(cli, "_load", return_value=self.cfg), \
              mock.patch.object(safety, "preflight", return_value=[]), \
-             mock.patch.object(safety, "config_is_valid", return_value=(False, "битый json")), \
+             mock.patch.object(cli.launcher, "boot_test",
+                               return_value=launcher.BootResult(False, "не занял порты", "FATAL")), \
              mock.patch.object(cli.system, "brew_service",
                                side_effect=lambda a, *r, **k: self.restarts.append(a) or []):
             rc = cli.cmd_apply(self._args())
         self.assertEqual(1, rc)
-        self.assertEqual([], self.restarts, "службу трогать нельзя, если конфиг не принят")
-        self.assertEqual(self.previous, self.cfg.local.singbox_config.read_text())
+        self.assertEqual([], self.restarts, "службу трогать нельзя, если конфиг не поднялся")
+        self.assertEqual(self.previous, self.cfg.local.singbox_config.read_text(),
+                         "живой конфиг обязан остаться прежним")
 
     def test_fatal_preflight_changes_nothing(self):
         stop = [safety.Problem(safety.STOP, "служба читает другой файл")]

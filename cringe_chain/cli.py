@@ -7,7 +7,7 @@ import json
 import pathlib
 import sys
 
-from . import audit, config as cfgmod, pacserver, probe, render, safety, system
+from . import audit, config as cfgmod, launcher, pacserver, probe, render, safety, system
 
 TRACE_TARGET = "https://api.anthropic.com"
 
@@ -70,17 +70,25 @@ def cmd_apply(args) -> int:
     for made in safety.ensure_dirs(cfg, pac_path):
         print(f"  создан каталог {made}")
 
+    # Репетиция: поднимаем НАСТОЯЩИЙ sing-box на этом самом конфиге, на
+    # черновых портах. Это единственная проверка, которая доказывает, что
+    # служба встанет: `check` принимает конфиги, на которых она падает.
+    # Пока репетиция не прошла, живого конфига мы не касаемся вовсе.
+    rehearsal = launcher.boot_test(sb)
+    if not rehearsal:
+        print(f"  ! конфиг не поднимается: {rehearsal.reason}", file=sys.stderr)
+        if rehearsal.log:
+            print("    " + rehearsal.log.splitlines()[-1][:200], file=sys.stderr)
+        print("  ничего не менял: ни конфига, ни службы, ни системы.", file=sys.stderr)
+        return 1
+    print(f"  репетиция       -> {rehearsal.reason}")
+
     pac_path.write_text(pac_text)
     print(f"  PAC             -> {pac_path}")
 
     with safety.ConfigSwap(cfg.local.singbox_config, text) as swap:
         if swap.backup:
             print(f"  резерв прежнего -> {swap.backup.name}")
-        ok, why = safety.config_is_valid(cfg.local.singbox_config)
-        if not ok:
-            print(f"  ! sing-box не принимает новый конфиг:\n    {why}", file=sys.stderr)
-            print("  прежний конфиг возвращён, служба не трогалась", file=sys.stderr)
-            return 1
 
         system.brew_service("restart", "sing-box", cfg.local.brew)
         live, why = safety.service_came_up(cfg)
@@ -151,6 +159,26 @@ def cmd_on(args) -> int:
     stop = _preflight_or_stop(cfg, args)
     if stop is not None:
         return stop
+
+    # 0. репетиция того конфига, что лежит на диске: если его правили руками
+    #    и сломали, лучше узнать до того, как система переключится на прокси
+    if cfg.local.singbox_config.exists():
+        try:
+            on_disk = json.loads(cfg.local.singbox_config.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"  ! конфиг {cfg.local.singbox_config} не читается: {exc}", file=sys.stderr)
+            print("  системные настройки НЕ трогал.", file=sys.stderr)
+            return 1
+        safety.ensure_dirs(cfg, pacserver.pac_file(cfg))
+        rehearsal = launcher.boot_test(on_disk)
+        if not rehearsal:
+            print(f"  ! конфиг на диске не поднимается: {rehearsal.reason}", file=sys.stderr)
+            if rehearsal.log:
+                print("    " + rehearsal.log.splitlines()[-1][:200], file=sys.stderr)
+            print("  системные настройки НЕ трогал. Почини конфиг или сделай rescue.",
+                  file=sys.stderr)
+            return 1
+        print(f"  репетиция конфига: {rehearsal.reason}")
 
     # 1. служба
     system.brew_service("start", "sing-box", cfg.local.brew)
