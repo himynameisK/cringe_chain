@@ -7,7 +7,7 @@ import json
 import pathlib
 import sys
 
-from . import audit, config as cfgmod, pacserver, probe, render, system
+from . import audit, config as cfgmod, pacserver, probe, render, safety, system
 
 TRACE_TARGET = "https://api.anthropic.com"
 
@@ -20,80 +20,173 @@ def _load(args) -> cfgmod.Config:
     return cfgmod.load(pathlib.Path(args.config) if args.config else None)
 
 
+def _preflight_or_stop(cfg, args) -> int | None:
+    """Проверки до изменений. Возвращает код выхода, если идти дальше нельзя."""
+    try:
+        _, pac_port, _ = pacserver.endpoint(cfg)
+    except cfgmod.ConfigError as exc:
+        print(f"Настройки: {exc}", file=sys.stderr)
+        return 2
+    problems = safety.preflight(cfg, pacserver.LABEL, pac_port)
+    for pr in problems:
+        mark = "СТОП " if pr.fatal else "осторожно "
+        print(f"  {mark}{pr.text}", file=sys.stderr)
+        if pr.hint:
+            print(f"        {pr.hint}", file=sys.stderr)
+    if any(pr.fatal for pr in problems) and not getattr(args, "force", False):
+        print("\nНичего не меняю. Исправь причину или повтори с --force, "
+              "если понимаешь последствия.", file=sys.stderr)
+        return 3
+    return None
+
+
 def cmd_apply(args) -> int:
     """Перегенерить конфиг sing-box и PAC из ОДНОГО списка доменов.
 
-    Смысл команды в том, что после неё они не могут разойтись: оба файла
-    порождены одним полем настроек.
+    Операция транзакционная: прежний конфиг сохраняется, новый проверяется
+    сам по себе, и если служба после перезапуска не заняла порты — прежний
+    файл возвращается на место и служба поднимается обратно. Без этого
+    неудачный apply оставлял мёртвый прокси, на который смотрела вся система.
     """
     cfg = _load(args)
     sb = render.singbox_config(cfg)
     pac_text = render.pac(cfg)
-    # имя файла диктует pac_url: раздатчик отдаёт каталог, система просит оттуда
-    # конкретное имя, и разойтись они не должны
     pac_path = pacserver.pac_file(cfg)
+    text = json.dumps(sb, indent=2, ensure_ascii=False) + "\n"
 
     if args.dry_run:
-        print(f"записал бы {cfg.local.singbox_config} ({len(json.dumps(sb))} байт)")
+        print(f"записал бы {cfg.local.singbox_config} ({len(text)} байт)")
         print(f"записал бы {pac_path} ({len(pac_text)} байт)")
+        for d in (cfg.local.singbox_config.parent, pac_path.parent, cfg.local.singbox_log.parent):
+            if not d.exists():
+                print(f"создал бы каталог {d}")
         print(f"перезапустил бы sing-box через {cfg.local.brew}")
         return 0
 
-    cfg.local.singbox_config.parent.mkdir(parents=True, exist_ok=True)
-    cfg.local.singbox_config.write_text(json.dumps(sb, indent=2, ensure_ascii=False) + "\n")
-    pac_path.parent.mkdir(parents=True, exist_ok=True)
+    stop = _preflight_or_stop(cfg, args)
+    if stop is not None:
+        return stop
+
+    for made in safety.ensure_dirs(cfg, pac_path):
+        print(f"  создан каталог {made}")
+
     pac_path.write_text(pac_text)
-    print(f"  конфиг sing-box -> {cfg.local.singbox_config}")
     print(f"  PAC             -> {pac_path}")
 
-    doms = len(cfg.routing.tunnel_domains)
-    print(f"  в туннель: {doms} доменов, {len(cfg.routing.tunnel_cidrs)} подсетей")
-    system.brew_service("restart", "sing-box", cfg.local.brew)
-    if system.wait_for_port(cfg.local.entry_port, 20):
-        print("  sing-box перезапущен и слушает")
-    else:
-        print("  ! sing-box не занял порт, смотри его журнал", file=sys.stderr)
-        return 1
+    with safety.ConfigSwap(cfg.local.singbox_config, text) as swap:
+        if swap.backup:
+            print(f"  резерв прежнего -> {swap.backup.name}")
+        ok, why = safety.config_is_valid(cfg.local.singbox_config)
+        if not ok:
+            print(f"  ! sing-box не принимает новый конфиг:\n    {why}", file=sys.stderr)
+            print("  прежний конфиг возвращён, служба не трогалась", file=sys.stderr)
+            return 1
+
+        system.brew_service("restart", "sing-box", cfg.local.brew)
+        live, why = safety.service_came_up(cfg)
+        if not live:
+            print(f"  ! служба не поднялась: {why}", file=sys.stderr)
+            print("  возвращаю прежний конфиг и перезапускаю обратно...", file=sys.stderr)
+            if swap.restore():
+                system.brew_service("restart", "sing-box", cfg.local.brew)
+                back, back_why = safety.service_came_up(cfg)
+                print(f"  откат: {'служба поднялась на прежнем конфиге' if back else back_why}",
+                      file=sys.stderr)
+            else:
+                print("  откат невозможен: прежнего конфига не было", file=sys.stderr)
+            print("\n  последние строки журнала:", file=sys.stderr)
+            print(safety.log_tail(cfg), file=sys.stderr)
+            return 1
+        swap.commit()
+
+    print(f"  конфиг sing-box -> {cfg.local.singbox_config}")
+    print(f"  в туннель: {len(cfg.routing.tunnel_domains)} доменов, "
+          f"{len(cfg.routing.tunnel_cidrs)} подсетей")
+    print(f"  служба: {why}")
     return 0
 
 
+def cmd_rollback(args) -> int:
+    """Вернуть прошлый конфиг из резерва и поднять службу на нём."""
+    cfg = _load(args)
+    backup = safety.latest_backup(cfg.local.singbox_config)
+    if backup is None:
+        print("Резервных копий конфига нет.", file=sys.stderr)
+        return 1
+    print(f"  возвращаю {backup.name}")
+    if args.dry_run:
+        print(f"  перезаписал бы {cfg.local.singbox_config} и перезапустил службу")
+        return 0
+    cfg.local.singbox_config.write_text(backup.read_text())
+    system.brew_service("restart", "sing-box", cfg.local.brew)
+    live, why = safety.service_came_up(cfg)
+    print(f"  служба: {why}")
+    return 0 if live else 1
+
+
 def cmd_on(args) -> int:
+    """Поднять службу и переключить систему.
+
+    Порядок важен и выстрадан: система переключается на прокси ТОЛЬКО после
+    того, как прокси ответил. Иначе HTTPS_PROXY указывает на мёртвый порт —
+    а у переменной окружения, в отличие от PAC, нет запасного «иди напрямую»,
+    и консольные программы остаются вообще без сети.
+    """
     cfg = _load(args)
     print("Включаю:")
-    system.brew_service("start", "sing-box", cfg.local.brew, dry_run=args.dry_run)
-    if not args.dry_run and not system.wait_for_port(cfg.local.entry_port, 20):
-        print("  ! sing-box не поднялся за 20 секунд", file=sys.stderr)
-        return 1
-
-    # без раздатчика система просит PAC по адресу, где никто не отвечает,
-    # и молча ходит напрямую
-    for cmd in pacserver.install(cfg, dry_run=args.dry_run):
-        if args.dry_run:
+    if args.dry_run:
+        print(f"  запустил бы sing-box через {cfg.local.brew}")
+        for cmd in pacserver.install(cfg, dry_run=True):
             print("  " + cmd)
-    if not args.dry_run:
-        print(f"  PAC             -> {pacserver.state(cfg)}")
+        for service in system.network_services():
+            for cmd in system.set_pac(service, cfg.local.pac_url, dry_run=True):
+                print("  " + cmd)
+            for cmd in system.set_bypass(service, cfg.routing.bypass_domains, dry_run=True):
+                print("  " + cmd)
+        for var in ("HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"):
+            for cmd in system.setenv(var, "…", dry_run=True):
+                print("  " + cmd)
+        return 0
 
+    stop = _preflight_or_stop(cfg, args)
+    if stop is not None:
+        return stop
+
+    # 1. служба
+    system.brew_service("start", "sing-box", cfg.local.brew)
+    live, why = safety.service_came_up(cfg)
+    if not live:
+        print(f"  ! sing-box не поднялся: {why}", file=sys.stderr)
+        print("  системные настройки НЕ трогал — ты остаёшься на прежней схеме.",
+              file=sys.stderr)
+        print("\n  последние строки журнала:", file=sys.stderr)
+        print(safety.log_tail(cfg), file=sys.stderr)
+        return 1
+    print(f"  sing-box: {why}")
+
+    # 2. раздатчик PAC, и убеждаемся, что он действительно отдаёт файл
+    pacserver.install(cfg)
+    state = pacserver.state(cfg)
+    if "раздаёт" not in state:
+        print(f"  ! раздатчик PAC не работает: {state}", file=sys.stderr)
+        print("  снимаю его и не трогаю системные настройки.", file=sys.stderr)
+        pacserver.uninstall()
+        return 1
+    print(f"  PAC: {state}")
+
+    # 3. только теперь система
     for service in system.network_services():
-        for cmd in system.set_pac(service, cfg.local.pac_url, dry_run=args.dry_run):
-            if args.dry_run:
-                print("  " + cmd)
-        for cmd in system.set_bypass(service, cfg.routing.bypass_domains, dry_run=args.dry_run):
-            if args.dry_run:
-                print("  " + cmd)
-        if not args.dry_run:
-            print(f"  прокси {service:<20} -> {system.proxy_state(service)}")
+        system.set_pac(service, cfg.local.pac_url)
+        system.set_bypass(service, cfg.routing.bypass_domains)
+        print(f"  прокси {service:<22} -> {system.proxy_state(service)}")
 
     for var, val in (("HTTPS_PROXY", _entry(cfg)),
                      ("HTTP_PROXY", _entry(cfg)),
                      ("NO_PROXY", ",".join(cfg.routing.no_proxy))):
-        for cmd in system.setenv(var, val, dry_run=args.dry_run):
-            if args.dry_run:
-                print("  " + cmd)
-    if not args.dry_run:
-        print("  переменные окружения прописаны (их подхватят программы, запущенные позже)")
-        print()
-        return cmd_status(args)
-    return 0
+        system.setenv(var, val)
+    print("  переменные окружения прописаны (их подхватят программы, запущенные позже)")
+    print()
+    return cmd_status(args)
 
 
 def cmd_off(args) -> int:
@@ -116,6 +209,9 @@ def cmd_off(args) -> int:
     if not args.dry_run:
         print("  переменные окружения сняты")
         print("\nПрограммы, запущенные раньше, могли запомнить прокси — их надо перезапустить.")
+        # Тот самый случай: откат настроек не чинит сломанный конфиг на диске.
+        print(f"Файл {cfg.local.singbox_config} не тронут — если дело в нём, "
+              "верни прежний командой rollback.")
     return 0
 
 
@@ -191,23 +287,46 @@ def cmd_leaks(args) -> int:
 
 
 def cmd_doctor(args) -> int:
-    """Проверки снизу вверх: бессмысленно разбирать правила, пока не доходит TCP."""
+    """Проверки снизу вверх: сперва то, что ломает тихо, потом сеть."""
     cfg = _load(args)
     entry = _entry(cfg)
+    rc = 0
+
+    print("Предохранители:")
+    try:
+        _, pac_port, _ = pacserver.endpoint(cfg)
+    except cfgmod.ConfigError as exc:
+        print(f"  СТОП {exc}")
+        return 2
+    problems = safety.preflight(cfg, pacserver.LABEL, pac_port)
+    if not problems:
+        print("  всё чисто")
+    for pr in problems:
+        print(f"  {'СТОП ' if pr.fatal else 'осторожно '}{pr.text}")
+        if pr.hint:
+            print(f"        {pr.hint}")
+        rc = max(rc, 3 if pr.fatal else 0)
+
+    print("Каталоги, куда пакет пишет:")
+    for d in (cfg.local.singbox_config.parent, pacserver.pac_file(cfg).parent,
+              cfg.local.singbox_log.parent):
+        print(f"  {'есть    ' if d.exists() else 'НЕТ     '}{d}")
+
     print("Звенья цепочки:")
     for server in render.chain_order(cfg):
         check = probe.port_open(server.host, server.port)
-        mark = "открыт" if check.open else "НЕ ДОХОДИТ"
         detour = f" (через {server.detour})" if server.detour else ""
-        print(f"  {server.name:<16} {server.host}:{server.port:<6} {mark}{detour}")
+        print(f"  {server.name:<16} {server.host}:{server.port:<6} "
+              f"{'открыт' if check.open else 'НЕ ДОХОДИТ'}{detour}")
+
     print("Локальные порты:")
     for port in (cfg.local.entry_port, cfg.local.socks_port):
         print(f"  127.0.0.1:{port:<6} {'слушает' if system.wait_for_port(port, 3) else 'молчит'}")
+
     print("Через прокси:")
-    print(f"  цель                -> {probe.http_code(TRACE_TARGET + '/v1/messages', proxy=entry)}")
     tr = probe.trace(TRACE_TARGET, proxy=entry)
     print(f"  нас видят как       -> ip={tr.ip} loc={tr.loc}")
-    return 0
+    return rc
 
 
 def cmd_link(args) -> int:
@@ -234,18 +353,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--config", help="путь к config.toml (по умолчанию ~/.config/cringe-chain/config.toml)")
     sub = p.add_subparsers(dest="command", required=True)
 
-    def add(name, func, help_text, *, dry=False, as_json=False):
+    def add(name, func, help_text, *, dry=False, as_json=False, force=False):
         sp = sub.add_parser(name, help=help_text)
-        sp.set_defaults(func=func, dry_run=False, json=False)
+        sp.set_defaults(func=func, dry_run=False, json=False, force=False)
         if dry:
             sp.add_argument("--dry-run", action="store_true",
                             help="ничего не делать, напечатать команды")
         if as_json:
             sp.add_argument("--json", action="store_true", help="машиночитаемый вывод")
+        if force:
+            sp.add_argument("--force", action="store_true",
+                            help="выполнить, несмотря на сработавшие предохранители")
         return sp
 
-    add("apply", cmd_apply, "перегенерить конфиг sing-box и PAC из настроек", dry=True)
-    add("on", cmd_on, "поднять службу и включить системный прокси", dry=True)
+    add("apply", cmd_apply, "перегенерить конфиг sing-box и PAC из настроек",
+        dry=True, force=True)
+    add("rollback", cmd_rollback, "вернуть прошлый конфиг из резерва", dry=True)
+    add("on", cmd_on, "поднять службу и включить системный прокси", dry=True, force=True)
     add("off", cmd_off, "выключить прокси и остановить службу", dry=True)
     add("status", cmd_status, "что включено и куда реально идёт трафик", as_json=True)
     add("leaks", cmd_leaks, "что ушло мимо туннеля", as_json=True)
