@@ -7,7 +7,7 @@ import json
 import pathlib
 import sys
 
-from . import audit, config as cfgmod, probe, render, system
+from . import audit, config as cfgmod, pacserver, probe, render, system
 
 TRACE_TARGET = "https://api.anthropic.com"
 
@@ -29,7 +29,9 @@ def cmd_apply(args) -> int:
     cfg = _load(args)
     sb = render.singbox_config(cfg)
     pac_text = render.pac(cfg)
-    pac_path = cfg.local.pac_dir / "proxy.pac"
+    # имя файла диктует pac_url: раздатчик отдаёт каталог, система просит оттуда
+    # конкретное имя, и разойтись они не должны
+    pac_path = pacserver.pac_file(cfg)
 
     if args.dry_run:
         print(f"записал бы {cfg.local.singbox_config} ({len(json.dumps(sb))} байт)")
@@ -63,6 +65,14 @@ def cmd_on(args) -> int:
         print("  ! sing-box не поднялся за 20 секунд", file=sys.stderr)
         return 1
 
+    # без раздатчика система просит PAC по адресу, где никто не отвечает,
+    # и молча ходит напрямую
+    for cmd in pacserver.install(cfg, dry_run=args.dry_run):
+        if args.dry_run:
+            print("  " + cmd)
+    if not args.dry_run:
+        print(f"  PAC             -> {pacserver.state(cfg)}")
+
     for service in system.network_services():
         for cmd in system.set_pac(service, cfg.local.pac_url, dry_run=args.dry_run):
             if args.dry_run:
@@ -95,6 +105,9 @@ def cmd_off(args) -> int:
                 print("  " + cmd)
         if not args.dry_run:
             print(f"  прокси {service:<20} -> {system.proxy_state(service)}")
+    for cmd in pacserver.uninstall(dry_run=args.dry_run):
+        if args.dry_run:
+            print("  " + cmd)
     system.brew_service("stop", "sing-box", cfg.local.brew, dry_run=args.dry_run)
     for var in ("HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"):
         for cmd in system.unsetenv(var, dry_run=args.dry_run):
@@ -113,6 +126,7 @@ def cmd_status(args) -> int:
     tr = probe.trace(TRACE_TARGET, proxy=entry)
     data = {
         "singbox": system.service_state("sing-box", cfg.local.brew),
+        "pac": pacserver.state(cfg),
         "services": {s: system.proxy_state(s) for s in system.network_services()},
         "exit_ip_via_tunnel": tr.ip,
         "exit_loc": tr.loc,
@@ -125,6 +139,7 @@ def cmd_status(args) -> int:
         return 0 if data["ok"] else 1
 
     print(f"  sing-box            : {data['singbox']}")
+    print(f"  раздатчик PAC       : {data['pac']}")
     for name, state in data["services"].items():
         print(f"  прокси {name:<20} {state}")
     print(f"  цель видит нас как  : ip={tr.ip} loc={tr.loc} (узел {tr.colo})")
