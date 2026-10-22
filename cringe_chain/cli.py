@@ -189,30 +189,110 @@ def cmd_on(args) -> int:
     return cmd_status(args)
 
 
-def cmd_off(args) -> int:
-    cfg = _load(args)
-    print("Выключаю:")
+def _release_system(dry_run: bool = False) -> list[str]:
+    """Отцепить систему от прокси. Порядок строгий и важный.
+
+    Сперва переменные окружения, потом системный прокси, и только потом всё
+    остальное. Наоборот нельзя: пока переменная указывает на порт, а службы
+    за ним уже нет, у консольных программ нет сети вообще — у переменной, в
+    отличие от PAC, нет запасного пути «остальное напрямую».
+
+    Ничего не требует от настроек: эта функция должна работать и тогда, когда
+    config.toml не читается. Это аварийная часть, ей нельзя зависеть от того,
+    что могло сломаться.
+    """
+    done = []
+    for var in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY",
+                "https_proxy", "http_proxy", "all_proxy", "no_proxy"):
+        system.unsetenv(var, dry_run=dry_run)
+        done.append(f"снял {var}")
     for service in system.network_services():
-        for cmd in system.disable_proxy(service, dry_run=args.dry_run):
-            if args.dry_run:
-                print("  " + cmd)
-        if not args.dry_run:
-            print(f"  прокси {service:<20} -> {system.proxy_state(service)}")
-    for cmd in pacserver.uninstall(dry_run=args.dry_run):
-        if args.dry_run:
-            print("  " + cmd)
-    system.brew_service("stop", "sing-box", cfg.local.brew, dry_run=args.dry_run)
-    for var in ("HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"):
-        for cmd in system.unsetenv(var, dry_run=args.dry_run):
-            if args.dry_run:
-                print("  " + cmd)
-    if not args.dry_run:
-        print("  переменные окружения сняты")
-        print("\nПрограммы, запущенные раньше, могли запомнить прокси — их надо перезапустить.")
-        # Тот самый случай: откат настроек не чинит сломанный конфиг на диске.
-        print(f"Файл {cfg.local.singbox_config} не тронут — если дело в нём, "
-              "верни прежний командой rollback.")
+        system.disable_proxy(service, dry_run=dry_run)
+        done.append(f"прокси выключен у службы {service}")
+    return done
+
+
+def cmd_off(args) -> int:
+    """Выключить прокси: система идёт напрямую.
+
+    Это НЕ восстановление прежнего состояния — файл конфига остаётся как есть.
+    Если сломан он, нужен rescue или rollback.
+    """
+    print("Выключаю:")
+    for line in _release_system(dry_run=args.dry_run):
+        print("  " + line)
+    pacserver.uninstall(dry_run=args.dry_run)
+    print("  раздатчик PAC снят")
+    try:
+        cfg = _load(args)
+        system.brew_service("stop", "sing-box", cfg.local.brew, dry_run=args.dry_run)
+        print("  служба остановлена")
+        print(f"\nФайл {cfg.local.singbox_config} НЕ тронут. Если дело в нём — "
+              "верни прежний командой rollback, а полное восстановление — rescue.")
+    except cfgmod.ConfigError as exc:
+        print(f"  настройки не прочитались ({exc}); служба не остановлена",
+              file=sys.stderr)
+        print("  но система от прокси отцеплена — сеть должна работать напрямую")
+    print("\nПрограммы, запущенные раньше, могли запомнить прокси — их надо перезапустить.")
     return 0
+
+
+def cmd_rescue(args) -> int:
+    """Аварийное восстановление: вернуть сеть, чего бы это ни стоило.
+
+    Задумано как кнопка для положения «всё сломалось и я не понимаю что».
+    Поэтому: сначала отцепляем систему от прокси (сеть возвращается сразу же,
+    напрямую), и только потом разбираемся с конфигом. И поэтому же команда
+    не падает, если настройки не читаются, — она обязана работать в худшем
+    случае, а не в лучшем.
+    """
+    print("АВАРИЙНОЕ ВОССТАНОВЛЕНИЕ")
+    print("\n1. Отцепляю систему от прокси — сеть пойдёт напрямую:")
+    for line in _release_system(dry_run=args.dry_run):
+        print("  " + line)
+    pacserver.uninstall(dry_run=args.dry_run)
+    print("  раздатчик PAC снят")
+
+    if args.dry_run:
+        print("\n2. (сухой прогон) вернул бы прежний конфиг и поднял службу")
+        return 0
+
+    print("\n   Сеть сейчас должна работать напрямую, без туннеля.")
+
+    try:
+        cfg = _load(args)
+    except cfgmod.ConfigError as exc:
+        print(f"\n2. Настройки не читаются: {exc}", file=sys.stderr)
+        print("   Дальше автоматически сделать нечего, но главное уже сделано.",
+              file=sys.stderr)
+        return 1
+
+    system.brew_service("stop", "sing-box", cfg.local.brew)
+    print("\n2. Ищу конфиг, на котором служба действительно поднимается:")
+    backups = sorted(cfg.local.singbox_config.parent.glob(
+        cfg.local.singbox_config.name + ".backup-*"), reverse=True)
+    candidates = [cfg.local.singbox_config] + backups
+    for cand in candidates:
+        if not cand.exists():
+            continue
+        if cand != cfg.local.singbox_config:
+            cfg.local.singbox_config.write_text(cand.read_text())
+        ok, why = safety.config_is_valid(cfg.local.singbox_config)
+        if not ok:
+            print(f"   {cand.name}: отвергнут проверкой — {why.splitlines()[0][:70]}")
+            continue
+        safety.ensure_dirs(cfg, pacserver.pac_file(cfg))
+        system.brew_service("restart", "sing-box", cfg.local.brew)
+        live, why = safety.service_came_up(cfg, seconds=20)
+        print(f"   {cand.name}: {'ПОДНЯЛАСЬ' if live else why}")
+        if live:
+            print(f"\n3. Служба работает на {cand.name}.")
+            print("   Системный прокси остался выключенным — включить: cringe on")
+            return 0
+    print("\n3. Ни один конфиг не поднимается. Последние строки журнала:", file=sys.stderr)
+    print(safety.log_tail(cfg), file=sys.stderr)
+    print("   Сеть работает напрямую; туннель нужно чинить руками.", file=sys.stderr)
+    return 1
 
 
 def cmd_status(args) -> int:
@@ -371,6 +451,9 @@ def build_parser() -> argparse.ArgumentParser:
     add("rollback", cmd_rollback, "вернуть прошлый конфиг из резерва", dry=True)
     add("on", cmd_on, "поднять службу и включить системный прокси", dry=True, force=True)
     add("off", cmd_off, "выключить прокси и остановить службу", dry=True)
+    add("rescue", cmd_rescue,
+        "аварийно вернуть сеть: отцепить систему и поднять службу на рабочем конфиге",
+        dry=True)
     add("status", cmd_status, "что включено и куда реально идёт трафик", as_json=True)
     add("leaks", cmd_leaks, "что ушло мимо туннеля", as_json=True)
     add("doctor", cmd_doctor, "проверить каждое звено по очереди")

@@ -244,3 +244,98 @@ class OnOrderTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReleaseOrderTest(unittest.TestCase):
+    """Отцеплять систему надо в строгом порядке, иначе остаётся окно без сети."""
+
+    def test_env_vars_go_before_system_proxy(self):
+        order = []
+        with mock.patch.object(cli.system, "unsetenv",
+                               side_effect=lambda v, **k: order.append(("env", v))), \
+             mock.patch.object(cli.system, "network_services", return_value=["Wi-Fi"]), \
+             mock.patch.object(cli.system, "disable_proxy",
+                               side_effect=lambda s, **k: order.append(("proxy", s))):
+            cli._release_system()
+        kinds = [k for k, _ in order]
+        self.assertLess(kinds.index("proxy"), len(kinds))
+        self.assertTrue(all(k == "env" for k in kinds[:kinds.index("proxy")]),
+                        "переменные должны сниматься до системного прокси")
+
+    def test_lowercase_variants_are_cleared_too(self):
+        cleared = []
+        with mock.patch.object(cli.system, "unsetenv",
+                               side_effect=lambda v, **k: cleared.append(v)), \
+             mock.patch.object(cli.system, "network_services", return_value=[]), \
+             mock.patch.object(cli.system, "disable_proxy"):
+            cli._release_system()
+        for v in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
+            self.assertIn(v, cleared)
+
+
+class RescueTest(unittest.TestCase):
+    """Аварийная команда обязана работать в худшем случае, а не в лучшем."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        self.cfg = make_cfg(self.root)
+        self.cfg.local.singbox_config.parent.mkdir(parents=True)
+        self.cfg.local.singbox_config.write_text('{"битый": true}')
+        self.good = self.cfg.local.singbox_config.with_suffix(".json.backup-20261022-200000")
+        self.good.write_text('{"рабочий": true}')
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _args(self):
+        return mock.Mock(config=None, dry_run=False, force=False, json=False)
+
+    def test_system_is_released_even_if_settings_are_broken(self):
+        released = []
+        with mock.patch.object(cli, "_load", side_effect=cfgmod.ConfigError("файл битый")), \
+             mock.patch.object(cli.system, "unsetenv",
+                               side_effect=lambda v, **k: released.append(v)), \
+             mock.patch.object(cli.system, "network_services", return_value=["Wi-Fi"]), \
+             mock.patch.object(cli.system, "disable_proxy",
+                               side_effect=lambda s, **k: released.append(s)), \
+             mock.patch.object(cli.pacserver, "uninstall", return_value=[]):
+            rc = cli.cmd_rescue(self._args())
+        self.assertEqual(1, rc)
+        self.assertIn("HTTPS_PROXY", released)
+        self.assertIn("Wi-Fi", released)
+
+    def test_falls_back_to_a_backup_that_actually_starts(self):
+        tried = []
+
+        def came_up(cfg, seconds=25):
+            text = cfg.local.singbox_config.read_text()
+            tried.append(text)
+            return ("рабочий" in text, "оба порта слушают" if "рабочий" in text else "порты молчат")
+
+        with mock.patch.object(cli, "_load", return_value=self.cfg), \
+             mock.patch.object(cli.system, "unsetenv"), \
+             mock.patch.object(cli.system, "network_services", return_value=[]), \
+             mock.patch.object(cli.system, "disable_proxy"), \
+             mock.patch.object(cli.pacserver, "uninstall", return_value=[]), \
+             mock.patch.object(cli.system, "brew_service", return_value=[]), \
+             mock.patch.object(safety, "config_is_valid", return_value=(True, "")), \
+             mock.patch.object(safety, "service_came_up", side_effect=came_up):
+            rc = cli.cmd_rescue(self._args())
+
+        self.assertEqual(0, rc)
+        self.assertIn("рабочий", self.cfg.local.singbox_config.read_text(),
+                      "на диске должен остаться конфиг, на котором служба встала")
+        self.assertEqual(2, len(tried), "сначала текущий, потом резерв")
+
+    def test_reports_failure_when_nothing_starts(self):
+        with mock.patch.object(cli, "_load", return_value=self.cfg), \
+             mock.patch.object(cli.system, "unsetenv"), \
+             mock.patch.object(cli.system, "network_services", return_value=[]), \
+             mock.patch.object(cli.system, "disable_proxy"), \
+             mock.patch.object(cli.pacserver, "uninstall", return_value=[]), \
+             mock.patch.object(cli.system, "brew_service", return_value=[]), \
+             mock.patch.object(safety, "config_is_valid", return_value=(True, "")), \
+             mock.patch.object(safety, "service_came_up", return_value=(False, "порты молчат")):
+            rc = cli.cmd_rescue(self._args())
+        self.assertEqual(1, rc)
